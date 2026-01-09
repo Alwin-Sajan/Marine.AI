@@ -25,7 +25,7 @@ const Page = () => {
             await new Promise(resolve => setTimeout(resolve, 1500));
 
             // Demo credentials check
-            if (formData.username === 'demo' && formData.password === 'password') {
+            if (formData.username === 'admin' && formData.password === '123') {
                 // Success
                 console.log('Login successful!');
                 // Store auth token (demo)
