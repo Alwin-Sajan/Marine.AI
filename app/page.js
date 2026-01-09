@@ -1,7 +1,6 @@
 'use client'
 import React, { useState, useRef, useEffect } from 'react'
-import { Plus, SendHorizontal, X, Image, FileText, Menu, Edit3, Trash2, MessageSquare, ChevronRight, Sparkles } from 'lucide-react'
-import axios from 'axios'
+import { Plus, SendHorizontal, X, Image, FileText, Menu, Edit3, Trash2, MessageSquare, ChevronRight, Sparkles, ParkingCircleOffIcon } from 'lucide-react'
 
 const MarineChatbot = () => {
   const [conversations, setConversations] = useState([
@@ -16,8 +15,12 @@ const MarineChatbot = () => {
   const fileInputRef = useRef(null)
   const imageInputRef = useRef(null)
   const messagesEndRef = useRef(null)
+  const abortControllerRef = useRef(null);
 
-  const API_BASE_URL = 'http://localhost:5000/api'
+  const userName = "Admin"; // Replace with actual user name logic
+
+  // Matches your backend endpoint exactly
+  const API_BASE_URL = 'http://localhost:8001/taxonomyChat'
 
   const currentConv = conversations.find(c => c.id === currentConvId)
   const messages = currentConv?.messages || []
@@ -90,53 +93,43 @@ const MarineChatbot = () => {
     setAttachments(newAttachments)
   }
 
-  const sendMessageToBackend = async (userMessage, files = []) => {
-    try {
-      const formData = new FormData()
-      formData.append('message', userMessage)
-      files.forEach((attachment) => {
-        formData.append('files', attachment.file)
-      })
-
-      const response = await axios.post(`${API_BASE_URL}/chat`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      })
-      return response.data
-    } catch (error) {
-      console.error('Error sending message:', error)
-      throw error
-    }
-  }
-
-  const sendTextMessageToBackend = async (userMessage) => {
-    try {
-      const response = await axios.post(`${API_BASE_URL}/chat`, {
-        message: userMessage,
-        timestamp: new Date().toISOString()
-      }, {
-        headers: { 'Content-Type': 'application/json' },
-      })
-      return response.data
-    } catch (error) {
-      console.error('Error sending message:', error)
-      throw error
-    }
-  }
-
   const handleSend = async () => {
+  
+    if (isTyping) {
+        if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
+          abortControllerRef.current = null;
+          setIsTyping(false);
+        }
+        return;
+    }
+  
     if (!input.trim() && attachments.length === 0) return
 
+    // 1. Prepare User Message
     const userMessage = {
+      id: Date.now(),
       text: input,
       sender: 'user',
       attachments: [...attachments],
       timestamp: new Date()
     }
 
+    // 2. Prepare Placeholder Bot Message (for streaming)
+    const botMessageId = Date.now() + 1
+    const botMessage = {
+      id: botMessageId,
+      text: '', // Start empty
+      sender: 'bot',
+      timestamp: new Date(),
+      data: null
+    }
+
+    // 3. Update State with User Message AND Empty Bot Message
     setConversations(convs =>
       convs.map(c =>
         c.id === currentConvId
-          ? { ...c, messages: [...c.messages, userMessage], timestamp: new Date() }
+          ? { ...c, messages: [...c.messages, userMessage, botMessage], timestamp: new Date() }
           : c
       )
     )
@@ -145,45 +138,77 @@ const MarineChatbot = () => {
       updateConversationTitle(currentConvId, input)
     }
 
+    // 4. Reset Inputs
     const messageText = input
-    setInput('')
     const currentAttachments = [...attachments]
+    setInput('')
     setAttachments([])
     setIsTyping(true)
 
     try {
-      let responseData
-      if (currentAttachments.length > 0) {
-        responseData = await sendMessageToBackend(messageText, currentAttachments)
-      } else {
-        responseData = await sendTextMessageToBackend(messageText)
+      const formData = new FormData()
+      // Backend expects 'user_input' based on: user_input: str = Form(...)
+      formData.append('user_input', messageText)
+      
+      currentAttachments.forEach((attachment) => {
+        formData.append('files', attachment.file)
+      })
+
+      // 5. Fetch with Streaming
+      const response = await fetch(API_BASE_URL, {
+        method: 'POST',
+        body: formData,
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
       }
 
-      const botMessage = {
-        text: responseData.response || responseData.message || "I've analyzed your query about marine species. Here's what I found!",
-        sender: 'bot',
-        timestamp: new Date(),
-        data: responseData.data || null
+      // 6. Handle the Stream
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let done = false
+
+      while (!done) {
+        const { value, done: doneReading } = await reader.read()
+        done = doneReading
+        
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true })
+          
+          // Update the specific bot message in the state with the new chunk
+          setConversations(prevConvs => 
+            prevConvs.map(conv => {
+              if (conv.id === currentConvId) {
+                const updatedMessages = conv.messages.map(msg => {
+                  if (msg.id === botMessageId) {
+                    return { ...msg, text: msg.text + chunk }
+                  }
+                  return msg
+                })
+                return { ...conv, messages: updatedMessages }
+              }
+              return conv
+            })
+          )
+        }
       }
 
-      setConversations(convs =>
-        convs.map(c =>
-          c.id === currentConvId
-            ? { ...c, messages: [...c.messages, botMessage] }
-            : c
-        )
-      )
     } catch (error) {
-      const errorMessage = {
-        text: "I'm having trouble connecting right now. Please try again.",
-        sender: 'bot',
-        timestamp: new Date(),
-        isError: true
-      }
+      console.error('Error sending message:', error)
+      
+      // Update the bot message to show error
       setConversations(convs =>
         convs.map(c =>
           c.id === currentConvId
-            ? { ...c, messages: [...c.messages, errorMessage] }
+            ? { 
+                ...c, 
+                messages: c.messages.map(msg => 
+                  msg.id === botMessageId 
+                    ? { ...msg, text: "I'm having trouble connecting right now. Please try again.", isError: true }
+                    : msg
+                )
+              }
             : c
         )
       )
@@ -263,6 +288,15 @@ const MarineChatbot = () => {
           <div className="ml-4">
             <h2 className="text-sm font-medium text-gray-300">Marine Species Assistant</h2>
           </div>
+
+          <div className="ml-auto">
+            <a href='/login_page'
+            className="text-xs rounded-2xl text-gray-500 flex items-center space-x-1 border border-gray-700 px-3 py-1 bg-gray-800/50">
+              <ParkingCircleOffIcon/>
+              <p>{userName}</p>
+            </a>
+
+          </div>
         </div>
 
         {/* Messages */}
@@ -289,7 +323,7 @@ const MarineChatbot = () => {
                     key={i}
                     onClick={() => {
                       setInput(prompt.text)
-                      setTimeout(() => handleSend(), 100)
+                      setTimeout(() => handleSend(), 100) // Small delay to allow state to settle
                     }}
                     className="group relative overflow-hidden bg-gray-800/50 hover:bg-gray-800 border border-gray-700 hover:border-gray-600 rounded-xl p-4 text-left transition-all duration-200 hover:scale-[1.02]"
                   >
@@ -320,7 +354,7 @@ const MarineChatbot = () => {
                       )}
                     </div>
                     
-                    <div className={`flex-1 ${message.sender === 'user' ? 'text-right' : ''}`}>
+                    <div className={`flex-1 flex-row-reverse`}>
                       <div className={`inline-block rounded-2xl px-4 py-3 ${
                         message.sender === 'user'
                           ? 'bg-gradient-to-br from-cyan-600 to-blue-600 text-white'
@@ -348,43 +382,32 @@ const MarineChatbot = () => {
                           </div>
                         )}
                         
-                        {message.data && (
-                          <div className="mb-3 p-3 bg-black/20 rounded-lg text-left">
-                            {message.data.species_name && (
-                              <p className="font-semibold text-cyan-300">🐠 {message.data.species_name}</p>
-                            )}
-                            {message.data.scientific_name && (
-                              <p className="text-xs italic text-gray-400 mt-1">{message.data.scientific_name}</p>
-                            )}
-                          </div>
+                        {/* Only show text if it exists (avoids empty bubbles during initial load) */}
+                        {message.text && (
+                          <p className="whitespace-pre-wrap text-sm leading-relaxed text-left">
+                            {message.text.split(/(\*\*.*?\*\*)/g).map((part, i) => {
+                              if (part.startsWith('**') && part.endsWith('**')) {
+                                return <strong key={i} className="font-bold text-white">{part.slice(2, -2)}</strong>;
+                              }
+                              return part;
+                            })}
+                          </p>
                         )}
-                        
-                        <p className="whitespace-pre-wrap text-sm leading-relaxed">{message.text}</p>
+                       
+                        {/* Show typing indicator INSIDE bubble if empty and typing */}
+                        {(!message.text && isTyping && message.sender === 'bot') && (
+                           <span className="inline-flex space-x-1">
+                             <span className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                             <span className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                             <span className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                           </span>
+                        )}
+
                       </div>
-                      <span className="text-xs text-gray-500 mt-1 inline-block">
-                        {/* {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} */}
-                      </span>
                     </div>
                   </div>
                 </div>
               ))}
-              
-              {isTyping && (
-                <div className="flex justify-start animate-slideIn">
-                  <div className="flex items-start space-x-3">
-                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-cyan-500 to-blue-500 flex items-center justify-center">
-                      <Sparkles className="w-4 h-4" />
-                    </div>
-                    <div className="bg-gray-800 rounded-2xl px-4 py-3">
-                      <div className="flex space-x-1.5">
-                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
-                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></div>
-                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
               <div ref={messagesEndRef} />
             </div>
           )}
